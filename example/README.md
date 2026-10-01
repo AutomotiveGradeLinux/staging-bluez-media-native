@@ -1,0 +1,195 @@
+# bluez_media_native examples
+
+These examples mirror the `bluez_native` CLI style. Run them from the package
+root after BlueZ is running and the native library is available.
+
+For CLI runs, the package resolves the native library in this order:
+
+1. `BLUEZ_MEDIA_LIB=/absolute/path/to/libbluez_media_native.so`
+2. executable-adjacent library paths
+3. local build outputs such as `build/native/libbluez_media_native.so`
+4. the system loader path, `libbluez_media_native.so`
+
+## Flutter BLE Audio
+
+The dedicated `flutter_ble_audio` Flutter Linux app discovers BlueZ media
+objects and groups them by Bluetooth device. Select one device at the top of
+the UI, then use whichever media surfaces BlueZ exposes for it:
+`org.bluez.MediaPlayer1`, `org.bluez.MediaControl1`, and
+`org.bluez.MediaTransport1`.
+
+```sh
+cd example/flutter_ble_audio
+flutter run -d linux
+```
+
+The app lets you select a discovered device, see which media interfaces it
+supports, refresh the current snapshots, send playback commands, adjust
+controller or transport volume, set `MediaPlayer1.Repeat` and
+`MediaPlayer1.Shuffle`, and inspect track and transport metadata.
+
+## Local Player Registration
+
+Register this process as a local media player object:
+
+```sh
+dart run example/register_player.dart list
+
+dart run example/register_player.dart \
+  --adapter /org/bluez/hci0 \
+  --player /bluez_media/player0 \
+  --name bluez_media_native \
+  --hold 30
+```
+
+## MediaPlayer1 Control
+
+Send standard player commands to a remote `org.bluez.MediaPlayer1` object:
+
+```dart
+final client = await BluezMediaClient.create(
+  coverArtMode: BluezMediaCoverArtMode.disabled,
+);
+final player = client.player('/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0');
+
+await player.play();
+await player.pause();
+await player.next();
+await player.fastForward();
+await player.rewind();
+final cover = await player.getCoverArt('/tmp/bluez-cover-art');
+
+await player.refresh();
+print(player.status);
+print(player.track);
+```
+
+```sh
+dart run example/player_control.dart list
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 play
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 pause
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 stop
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 next
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 previous
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 fast-forward
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 rewind
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 cover-art /tmp/bluez-cover-art
+dart run example/player_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 props
+```
+
+Cover art requires a running BlueZ `obexd` with the experimental BIP Image API
+enabled. The client reuses an existing matching BIP session or creates one while
+it is active so BlueZ can include `ImgHandle` in subsequent track metadata; an
+already-playing track may not gain a handle until its metadata changes. The
+target file must not already exist. Use `getCoverArtFromExistingSession` when
+the application must never create an OBEX session. The caller owns the target
+file and its cache lifetime in either case.
+
+## Media Cover Art
+
+Save cover art from the playing player by explicitly selecting one backend. If
+no player is present in the initial BlueZ snapshot, the command waits up to 20
+seconds for one. The modes never detect or fall back to each other.
+
+```sh
+dart run example/media_cover_art.dart /tmp/cover-art.jpg --mpris
+```
+
+To download directly through native OBEX, including by reusing an existing
+matching session:
+
+```sh
+dart run example/media_cover_art.dart /tmp/cover-art.jpg --native
+```
+
+MPRIS artwork keeps its original bytes, including animated GIF data supported
+by Flutter's built-in decoder. Native AVRCP thumbnails are normally static.
+
+Use `--player /org/bluez/.../player0` to select a specific player.
+
+## MediaControl1 Volume And Connectivity
+
+Use the deprecated but still available `org.bluez.MediaControl1` controller
+surface for volume adjustment and connected/player state snapshots:
+
+```dart
+final control = client.control('/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF');
+
+await control.volumeUp();
+await control.volumeDown();
+
+await control.refresh();
+print(control.connected);
+print(control.playerPath);
+```
+
+```sh
+dart run example/media_control.dart list
+dart run example/media_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF volume-up
+dart run example/media_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF volume-down
+dart run example/media_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF props
+dart run example/media_control.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF watch --seconds 30
+```
+
+## AVRCP Media Browsing
+
+Browse remote folders and playlist/media item trees via `MediaFolder1` and
+`MediaItem1`:
+
+The browsing CLI also accepts `cover-art <target_file>` for its player path:
+
+```sh
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 cover-art /tmp/bluez-cover-art
+```
+
+```dart
+final folder = client.folder('/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0');
+final items = await folder.listItems();
+
+for (final item in items) {
+  print('${item.name}: ${item.objectPath}');
+  if (item.playable) {
+    await item.play();
+  }
+}
+```
+
+```sh
+dart run example/media_browsing.dart list
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 pause
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 player-props
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 folder-props
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 list
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 search Coltrane
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0 cd /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0/folder0
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0/item0 item-props
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0/item0 play-item
+dart run example/media_browsing.dart /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/avrcp/player0/item0 add-now-playing
+```
+
+## MediaTransport1 Control
+
+Acquire an active audio stream transport or set the absolute stream volume:
+
+```dart
+final transport = client.transport('/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/fd0');
+
+await transport.setVolume(64);
+
+final result = await transport.acquire();
+try {
+  print(result.fd);
+} finally {
+  result.close(); // Close the duplicated file descriptor.
+  await transport.release();
+}
+```
+
+```sh
+dart run example/transport_control.dart list
+dart run example/transport_control.dart props /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep4/fd0
+dart run example/transport_control.dart set_volume /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep4/fd0 64
+dart run example/transport_control.dart acquire /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep4/fd0
+dart run example/transport_control.dart try_acquire /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep4/fd0
+dart run example/transport_control.dart release /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep4/fd0
+```

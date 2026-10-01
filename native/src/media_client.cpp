@@ -1,0 +1,95 @@
+// media_client.cpp
+#include "media_client.h"
+#include "bluez_media_types.h"
+#include "local_player.h"
+#include "media_utils.h"
+
+MediaClient::MediaClient(sdbus::IConnection& conn) : conn_(conn) {
+  try {
+    conn_.addObjectManager(sdbus::ObjectPath{"/"});
+  } catch (const sdbus::Error& e) {
+    fprintf(stderr, "MediaClient: failed to add ObjectManager: %s\n", e.what());
+  }
+}
+
+MediaClient::~MediaClient() = default;
+
+int MediaClient::register_player(
+    const BluezMediaPlayerRegistration& registration) {
+  if (registration.adapter_path == nullptr ||
+      registration.player_path == nullptr) {
+    return BLUEZ_MEDIA_ERROR_INVALID_ARGUMENT;
+  }
+  if (registration.browsable != 0 || registration.searchable != 0) {
+    return BLUEZ_MEDIA_ERROR_INVALID_ARGUMENT;
+  }
+  const std::scoped_lock lock(players_mutex_);
+  std::string player_path{registration.player_path};
+  if (players_.contains(player_path)) {
+    return BLUEZ_MEDIA_ERROR_ALREADY_EXISTS;
+  }
+
+  players_.emplace(player_path,
+                   std::make_unique<LocalPlayer>(conn_, registration));
+  return BLUEZ_MEDIA_SUCCESS;
+}
+
+int MediaClient::unregister_player(const char* adapter_path,
+                                   const char* player_path) {
+  if (adapter_path == nullptr || player_path == nullptr) {
+    return BLUEZ_MEDIA_ERROR_INVALID_ARGUMENT;
+  }
+  const std::scoped_lock lock(players_mutex_);
+  std::string player{player_path};
+  auto it = players_.find(player);
+  if (it == players_.end() || it->second->adapter_path() != adapter_path) {
+    return BLUEZ_MEDIA_ERROR_NOT_FOUND;
+  }
+  players_.erase(it);
+  return BLUEZ_MEDIA_SUCCESS;
+}
+
+std::vector<uint8_t> MediaClient::get_managed_objects() const {
+  auto proxy = sdbus::createProxy(conn_, sdbus::ServiceName{"org.bluez"},
+                                  sdbus::ObjectPath{"/"});
+  std::map<sdbus::ObjectPath,
+           std::map<std::string, std::map<std::string, sdbus::Variant>>>
+      objects;
+  media_call(*proxy, "org.freedesktop.DBus.ObjectManager",
+             "GetManagedObjects") >>
+      objects;
+
+  BlueZMediaManagedObjects result;
+  for (const auto& [path, interfaces] : objects) {
+    if (interfaces.contains("org.bluez.Media1")) {
+      result.media.push_back(path);
+    }
+    if (interfaces.contains("org.bluez.MediaPlayer1")) {
+      result.players.push_back(path);
+    }
+    if (interfaces.contains("org.bluez.MediaControl1")) {
+      result.controls.push_back(path);
+    }
+    if (interfaces.contains("org.bluez.MediaTransport1")) {
+      result.transports.push_back(path);
+    }
+    if (interfaces.contains("org.bluez.MediaFolder1")) {
+      result.folders.push_back(path);
+    }
+    if (interfaces.contains("org.bluez.MediaItem1")) {
+      result.items.push_back(path);
+    }
+  }
+  return glz::encode(result);
+}
+
+void MediaClient::invalidate_registrations(const std::string& adapter_path) {
+  const std::scoped_lock lock(players_mutex_);
+  for (auto it = players_.begin(); it != players_.end();) {
+    if (adapter_path.empty() || it->second->adapter_path() == adapter_path) {
+      it->second->abandon();
+      it = players_.erase(it);
+    } else
+      ++it;
+  }
+}

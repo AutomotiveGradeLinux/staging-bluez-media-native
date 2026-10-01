@@ -1,0 +1,2069 @@
+import 'dart:async';
+import 'dart:io' as io;
+
+import 'package:bluez_media_native/bluez_media_native.dart';
+import 'package:flutter/material.dart';
+
+void main() {
+  const value = String.fromEnvironment(
+    'BLUEZ_MEDIA_COVER_ART',
+    defaultValue: 'native',
+  );
+  final mode = switch (value) {
+    'native' => BluezMediaCoverArtMode.native,
+    'mpris' => BluezMediaCoverArtMode.mpris,
+    _ => throw ArgumentError(
+      'Set --dart-define=BLUEZ_MEDIA_COVER_ART=native or mpris.',
+    ),
+  };
+  runApp(BluezMediaExample(coverArtMode: mode));
+}
+
+class BluezMediaExample extends StatelessWidget {
+  final BluezMediaCoverArtMode coverArtMode;
+
+  const BluezMediaExample({required this.coverArtMode, super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'BlueZ Media',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xff0f766e),
+          brightness: Brightness.light,
+        ),
+        useMaterial3: true,
+        visualDensity: VisualDensity.compact,
+      ),
+      home: MediaProxyDashboard(coverArtMode: coverArtMode),
+    );
+  }
+}
+
+class MediaProxyDashboard extends StatefulWidget {
+  final BluezMediaCoverArtMode coverArtMode;
+
+  const MediaProxyDashboard({required this.coverArtMode, super.key});
+
+  @override
+  State<MediaProxyDashboard> createState() => _MediaProxyDashboardState();
+}
+
+class _MediaProxyDashboardState extends State<MediaProxyDashboard> {
+  BluezMediaClient? _client;
+  final _subscriptions = <StreamSubscription<dynamic>>[];
+  final _messages = <String>[];
+  var _loading = true;
+  String? _error;
+
+  List<BluezMediaPlayer> _players = const [];
+  List<BluezMediaControl> _controls = const [];
+  List<BluezMediaTransport> _transports = const [];
+  List<BluezMediaFolder> _folders = const [];
+  List<BluezMediaItem> _items = const [];
+
+  String? _selectedDevicePath;
+  io.Directory? _coverArtDirectory;
+  String? _coverArtTrackKey;
+  String? _coverArtPath;
+  var _coverArtLoading = false;
+  var _coverArtPending = false;
+  Timer? _coverArtRetryTimer;
+  String? _coverArtRetryKey;
+  var _coverArtRetryCount = 0;
+  bool get _useMprisProxy =>
+      widget.coverArtMode == BluezMediaCoverArtMode.mpris;
+  double? _transportVolumeDraft;
+
+  List<_MediaDevice> get _devices =>
+      _mediaDevices(_players, _controls, _transports, _folders, _items);
+
+  _MediaDevice? get _selectedDevice {
+    final devices = _devices;
+    if (devices.isEmpty) return null;
+    final selectedPath = _selectedDevicePath;
+    if (selectedPath == null) return devices.first;
+    return devices
+            .where((device) => device.devicePath == selectedPath)
+            .firstOrNull ??
+        devices.first;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadObjects());
+  }
+
+  @override
+  void dispose() {
+    _coverArtRetryTimer?.cancel();
+    for (final subscription in _subscriptions) {
+      subscription.cancel();
+    }
+    final coverArtDirectory = _coverArtDirectory;
+    if (coverArtDirectory != null) {
+      unawaited(_deleteDirectory(coverArtDirectory));
+    }
+    final client = _client;
+    if (client != null) unawaited(client.close());
+    super.dispose();
+  }
+
+  Future<void> _loadObjects() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final existingClient = _client;
+      final client = existingClient ?? await _createClient();
+      if (!mounted) {
+        if (existingClient == null) await client.close();
+        return;
+      }
+      _client = client;
+      await client.getManagedObjects();
+      if (!mounted) return;
+
+      for (final subscription in _subscriptions) {
+        await subscription.cancel();
+      }
+      if (!mounted) return;
+      _subscriptions
+        ..clear()
+        ..addAll([
+          for (final player in client.players) _playerSubscription(player),
+          for (final control in client.controls)
+            control.propertiesChanged.listen((_) => _refreshView()),
+          for (final transport in client.transports)
+            transport.propertiesChanged.listen((_) => _refreshView()),
+          for (final folder in client.folders)
+            folder.propertiesChanged.listen((_) => _refreshView()),
+          for (final item in client.items)
+            item.propertiesChanged.listen((_) => _refreshView()),
+          client.playerAdded.listen((player) {
+            if (!mounted) return;
+            _subscriptions.add(_playerSubscription(player));
+            _syncObjects(client);
+          }),
+          client.controlAdded.listen((control) {
+            if (!mounted) return;
+            _subscriptions.add(
+              control.propertiesChanged.listen((_) => _refreshView()),
+            );
+            _syncObjects(client);
+          }),
+          client.transportAdded.listen((transport) {
+            if (!mounted) return;
+            _subscriptions.add(
+              transport.propertiesChanged.listen((_) => _refreshView()),
+            );
+            _syncObjects(client);
+          }),
+          client.folderAdded.listen((folder) {
+            if (!mounted) return;
+            _subscriptions.add(
+              folder.propertiesChanged.listen((_) => _refreshView()),
+            );
+            _syncObjects(client);
+          }),
+          client.itemAdded.listen((item) {
+            if (!mounted) return;
+            _subscriptions.add(
+              item.propertiesChanged.listen((_) => _refreshView()),
+            );
+            _syncObjects(client);
+          }),
+          client.playerRemoved.listen((_) => _syncObjects(client)),
+          client.controlRemoved.listen((_) => _syncObjects(client)),
+          client.transportRemoved.listen((_) => _syncObjects(client)),
+          client.folderRemoved.listen((_) => _syncObjects(client)),
+          client.itemRemoved.listen((_) => _syncObjects(client)),
+        ]);
+
+      setState(() {
+        _players = client.players;
+        _controls = client.controls;
+        _transports = client.transports;
+        _folders = client.folders;
+        _items = client.items;
+        _selectedDevicePath = _keepDeviceSelection(
+          _devices,
+          _selectedDevicePath,
+        );
+        _transportVolumeDraft = null;
+        _loading = false;
+      });
+
+      await _refreshSelected();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$error';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<BluezMediaClient> _createClient() async {
+    return BluezMediaClient.create(coverArtMode: widget.coverArtMode);
+  }
+
+  StreamSubscription<List<String>> _playerSubscription(
+    BluezMediaPlayer player,
+  ) {
+    return player.propertiesChanged.listen((changed) {
+      _refreshView();
+      if (changed.contains('Track') &&
+          player == _selectedDevice?.player &&
+          (_useMprisProxy
+              ? _trackValue(player, const ['Item', 'mpris:trackid']).isNotEmpty
+              : player.imageHandle.isNotEmpty)) {
+        unawaited(_getCoverArt());
+      }
+    });
+  }
+
+  void _syncObjects(BluezMediaClient client) {
+    if (!mounted) return;
+    setState(() {
+      _players = client.players;
+      _controls = client.controls;
+      _transports = client.transports;
+      _folders = client.folders;
+      _items = client.items;
+      _selectedDevicePath = _keepDeviceSelection(_devices, _selectedDevicePath);
+    });
+  }
+
+  void _refreshView() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _refreshSelected() async {
+    final device = _selectedDevice;
+    try {
+      await device?.player?.refresh();
+      final player = device?.player;
+      if (player != null &&
+          player == _selectedDevice?.player &&
+          (_useMprisProxy
+              ? _trackValue(player, const ['Item', 'mpris:trackid']).isNotEmpty
+              : player.imageHandle.isNotEmpty)) {
+        unawaited(_getCoverArt());
+      }
+      await device?.control?.refresh();
+      for (final folder in device?.folders ?? const <BluezMediaFolder>[]) {
+        await folder.refresh();
+      }
+      for (final item in device?.items ?? const <BluezMediaItem>[]) {
+        await item.refresh();
+      }
+      for (final transport
+          in device?.transports ?? const <BluezMediaTransport>[]) {
+        await transport.refresh();
+      }
+      _pushMessage('Refreshed selected device');
+      _refreshView();
+    } catch (error) {
+      _pushMessage('$error');
+    }
+  }
+
+  void _runCommand(String label, FutureOr<void> Function() command) {
+    unawaited(() async {
+      try {
+        await command();
+        _pushMessage(label);
+        _refreshView();
+      } catch (error) {
+        _pushMessage('$error');
+      }
+    }());
+  }
+
+  Future<void> _listFolderItems(BluezMediaFolder folder) async {
+    try {
+      final knownPaths = _items.map((item) => item.objectPath).toSet();
+      final children = await folder.listItems();
+      for (final child in children) {
+        if (knownPaths.add(child.objectPath)) {
+          _subscriptions.add(
+            child.propertiesChanged.listen((_) => _refreshView()),
+          );
+        }
+      }
+      setState(() {
+        _items = _mergeItems(_items, children);
+      });
+      _pushMessage(
+        'Listed ${children.length} item(s) from ${_objectName(folder.objectPath)}',
+      );
+    } catch (error) {
+      _pushMessage('$error');
+    }
+  }
+
+  void _setRepeatMode(String repeat) {
+    final player = _selectedDevice?.player;
+    if (player == null) {
+      _pushMessage('Selected device has no MediaPlayer1 support');
+      return;
+    }
+    _runCommand('MediaPlayer1 Repeat: $repeat', () async {
+      await player.setRepeat(repeat);
+      await player.refresh();
+    });
+  }
+
+  void _setShuffleMode(String shuffle) {
+    final player = _selectedDevice?.player;
+    if (player == null) {
+      _pushMessage('Selected device has no MediaPlayer1 support');
+      return;
+    }
+    _runCommand('MediaPlayer1 Shuffle: $shuffle', () async {
+      await player.setShuffle(shuffle);
+      await player.refresh();
+    });
+  }
+
+  Future<void> _getCoverArt() async {
+    final player = _selectedDevice?.player;
+    final client = _client;
+    final itemPath = _trackValue(player, const ['Item', 'mpris:trackid']);
+    if (player == null ||
+        client == null ||
+        (_useMprisProxy ? itemPath.isEmpty : player.imageHandle.isEmpty)) {
+      return;
+    }
+    if (_coverArtLoading) {
+      _coverArtPending = true;
+      return;
+    }
+
+    final trackKey = _trackKey(player);
+    if (_coverArtRetryKey != trackKey) {
+      _coverArtRetryTimer?.cancel();
+      _coverArtRetryTimer = null;
+      _coverArtRetryKey = trackKey;
+      _coverArtRetryCount = 0;
+    }
+    if (_coverArtPath != null && trackKey == _coverArtTrackKey) {
+      return;
+    }
+    setState(() => _coverArtLoading = true);
+    final elapsed = Stopwatch()..start();
+    io.Directory? directory;
+    try {
+      directory = await io.Directory.systemTemp.createTemp('bluez_media_art_');
+      final target = '${directory.path}/cover-art';
+      if (_useMprisProxy) {
+        List<int>? publishedBytes;
+        for (var attempt = 0; attempt < 2; attempt++) {
+          try {
+            publishedBytes = await client.getMprisCoverArt(itemPath);
+            break;
+          } catch (_) {
+            await Future<void>.delayed(const Duration(seconds: 2));
+            if (!mounted || trackKey != _trackKey(player)) {
+              await directory.delete(recursive: true);
+              return;
+            }
+          }
+        }
+        if (publishedBytes != null) {
+          await io.File(target).writeAsBytes(publishedBytes, flush: true);
+        } else {
+          await player.getCoverArtFromExistingSession(target);
+        }
+      } else {
+        await player.getCoverArt(target);
+      }
+      final path = target;
+      if (!mounted ||
+          player != _selectedDevice?.player ||
+          trackKey != _trackKey(player)) {
+        await directory.delete(recursive: true);
+        return;
+      }
+      final previous = _coverArtDirectory;
+      setState(() {
+        _coverArtDirectory = directory;
+        _coverArtTrackKey = trackKey;
+        _coverArtPath = path;
+      });
+      _coverArtRetryTimer?.cancel();
+      _coverArtRetryTimer = null;
+      _coverArtRetryCount = 0;
+      if (previous != null) {
+        unawaited(_deleteDirectory(previous));
+      }
+      _pushMessage(
+        'Saved cover art to $path in ${elapsed.elapsedMilliseconds} ms',
+      );
+    } catch (error) {
+      if (directory != null) {
+        unawaited(_deleteDirectory(directory));
+      }
+      _coverArtPending = false;
+      if (mounted && trackKey == _trackKey(player) && _coverArtRetryCount < 2) {
+        _coverArtRetryCount++;
+        _coverArtRetryTimer = Timer(
+          Duration(seconds: 2 * _coverArtRetryCount),
+          () {
+            _coverArtRetryTimer = null;
+            if (mounted && trackKey == _trackKey(player)) {
+              unawaited(_getCoverArt());
+            }
+          },
+        );
+      } else {
+        _pushMessage('$error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _coverArtLoading = false);
+        if (_coverArtPending) {
+          _coverArtPending = false;
+          unawaited(_getCoverArt());
+        }
+      }
+    }
+  }
+
+  void _setTransportVolume(double value) {
+    final transport = _selectedDevice?.transport;
+    if (transport == null) return;
+    _runCommand(
+      'MediaTransport1 Volume: ${value.round()}',
+      () => transport.setVolume(value.round().clamp(0, 127)),
+    );
+    setState(() => _transportVolumeDraft = null);
+  }
+
+  void _previewTransportVolume(double value) {
+    setState(() => _transportVolumeDraft = value);
+  }
+
+  void _pushMessage(String message) {
+    if (!mounted) return;
+    setState(() {
+      _messages.insert(0, message);
+      if (_messages.length > 6) {
+        _messages.removeLast();
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('BlueZ Media Devices'),
+        actions: [
+          Tooltip(
+            message: 'Refresh objects',
+            child: IconButton(
+              onPressed: _loading ? null : _loadObjects,
+              icon: const Icon(Icons.refresh),
+            ),
+          ),
+        ],
+      ),
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return _EmptyState(
+        icon: Icons.error_outline,
+        title: 'Unable to load BlueZ media',
+        subtitle: _error!,
+      );
+    }
+    if (_players.isEmpty &&
+        _controls.isEmpty &&
+        _transports.isEmpty &&
+        _folders.isEmpty &&
+        _items.isEmpty) {
+      return const _EmptyState(
+        icon: Icons.bluetooth_disabled,
+        title: 'No BlueZ media devices',
+        subtitle: 'Pair and connect an AVRCP-capable audio device.',
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final selectedDevice = _selectedDevice;
+        // Match the homescreen: retain the last valid image while BlueZ is
+        // still publishing metadata for the replacement track.
+        final coverArtPath = _coverArtPath;
+        final maxWidth = constraints.maxWidth >= 1040
+            ? 1000.0
+            : double.infinity;
+        final dashboard = _ProxyPanels(
+          device: selectedDevice,
+          messages: _messages,
+          onRefresh: _refreshSelected,
+          onRepeatChanged: _setRepeatMode,
+          onShuffleChanged: _setShuffleMode,
+          coverArtPath: coverArtPath,
+          coverArtLoading: _coverArtLoading,
+          useMprisProxy: _useMprisProxy,
+          onGetCoverArt: _getCoverArt,
+          onListFolderItems: _listFolderItems,
+          transportVolumeDraft: _transportVolumeDraft,
+          onTransportVolumePreview: _previewTransportVolume,
+          onTransportVolumeChanged: _setTransportVolume,
+          onCommand: _runCommand,
+        );
+
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: maxWidth),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _DevicePicker(
+                      devices: _devices,
+                      value: selectedDevice,
+                      onChanged: (device) {
+                        final previousCoverArt = _coverArtDirectory;
+                        _coverArtRetryTimer?.cancel();
+                        _coverArtRetryTimer = null;
+                        _coverArtRetryKey = null;
+                        _coverArtRetryCount = 0;
+                        setState(() {
+                          _selectedDevicePath = device?.devicePath;
+                          _coverArtDirectory = null;
+                          _coverArtTrackKey = null;
+                          _coverArtPath = null;
+                          _transportVolumeDraft = null;
+                        });
+                        if (previousCoverArt != null) {
+                          unawaited(_deleteDirectory(previousCoverArt));
+                        }
+                        unawaited(_refreshSelected());
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    dashboard,
+                  ],
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+Future<void> _deleteDirectory(io.Directory directory) async {
+  try {
+    await directory.delete(recursive: true);
+  } on io.FileSystemException {
+    // Best-effort cleanup for temporary cover art.
+  }
+}
+
+class _DevicePicker extends StatelessWidget {
+  final List<_MediaDevice> devices;
+  final _MediaDevice? value;
+  final ValueChanged<_MediaDevice?> onChanged;
+
+  const _DevicePicker({
+    required this.devices,
+    required this.value,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return _SectionPanel(
+      icon: Icons.bluetooth_connected,
+      title: 'Device',
+      trailing: Text('${devices.length}'),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          DropdownButtonFormField<_MediaDevice>(
+            initialValue: value,
+            isExpanded: true,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
+            ),
+            hint: const Text('No device'),
+            items: [
+              for (final device in devices)
+                DropdownMenuItem<_MediaDevice>(
+                  value: device,
+                  child: Row(
+                    children: [
+                      Icon(
+                        device.connected
+                            ? Icons.bluetooth_connected
+                            : Icons.bluetooth_disabled,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '${_deviceLabel(device)} - ${_connectionLabel(device)}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+            onChanged: devices.isEmpty ? null : onChanged,
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _SupportChip(
+                icon: value?.connected ?? false
+                    ? Icons.bluetooth_connected
+                    : Icons.bluetooth_disabled,
+                label: _connectionLabel(value),
+                supported: value?.connected ?? false,
+              ),
+              _SupportChip(
+                icon: Icons.queue_music,
+                label: 'MediaPlayer1',
+                supported: value?.player != null,
+              ),
+              _SupportChip(
+                icon: Icons.settings_remote,
+                label: 'MediaControl1',
+                supported: value?.control != null,
+              ),
+              _SupportChip(
+                icon: Icons.graphic_eq,
+                label: 'MediaTransport1',
+                supported: value?.transports.isNotEmpty ?? false,
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            value?.devicePath ?? 'No device selected',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SupportChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool supported;
+
+  const _SupportChip({
+    required this.icon,
+    required this.label,
+    required this.supported,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: supported ? colors.secondaryContainer : colors.surface,
+        border: Border.all(color: colors.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 18),
+            const SizedBox(width: 8),
+            Text(label),
+            const SizedBox(width: 8),
+            Icon(
+              supported ? Icons.check_circle : Icons.cancel_outlined,
+              size: 18,
+              color: supported ? colors.primary : colors.outline,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ProxyPanels extends StatelessWidget {
+  final _MediaDevice? device;
+  final List<String> messages;
+  final Future<void> Function() onRefresh;
+  final ValueChanged<String> onRepeatChanged;
+  final ValueChanged<String> onShuffleChanged;
+  final String? coverArtPath;
+  final bool coverArtLoading;
+  final bool useMprisProxy;
+  final VoidCallback onGetCoverArt;
+  final ValueChanged<BluezMediaFolder> onListFolderItems;
+  final double? transportVolumeDraft;
+  final ValueChanged<double> onTransportVolumePreview;
+  final ValueChanged<double> onTransportVolumeChanged;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _ProxyPanels({
+    required this.device,
+    required this.messages,
+    required this.onRefresh,
+    required this.onRepeatChanged,
+    required this.onShuffleChanged,
+    required this.coverArtPath,
+    required this.coverArtLoading,
+    required this.useMprisProxy,
+    required this.onGetCoverArt,
+    required this.onListFolderItems,
+    required this.transportVolumeDraft,
+    required this.onTransportVolumePreview,
+    required this.onTransportVolumeChanged,
+    required this.onCommand,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final player = device?.player;
+    final control = device?.control;
+    final transport = device?.transport;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Device controls',
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+            ),
+            Tooltip(
+              message: 'Refresh selected device',
+              child: IconButton.filledTonal(
+                onPressed: device == null ? null : onRefresh,
+                icon: const Icon(Icons.refresh),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        _PlayerProxyPanel(
+          player: player,
+          onRepeatChanged: onRepeatChanged,
+          onShuffleChanged: onShuffleChanged,
+          coverArtPath: coverArtPath,
+          coverArtLoading: coverArtLoading,
+          useMprisProxy: useMprisProxy,
+          onGetCoverArt: onGetCoverArt,
+          onCommand: onCommand,
+        ),
+        const SizedBox(height: 16),
+        _BrowseProxyPanel(
+          folders: device?.folders ?? const [],
+          items: device?.items ?? const [],
+          onListFolderItems: onListFolderItems,
+          onCommand: onCommand,
+        ),
+        const SizedBox(height: 16),
+        _ControlProxyPanel(control: control, onCommand: onCommand),
+        const SizedBox(height: 16),
+        _TransportProxyPanel(
+          transport: transport,
+          transportCount: device?.transports.length ?? 0,
+          volumeDraft: transportVolumeDraft,
+          onVolumePreview: onTransportVolumePreview,
+          onVolumeChanged: onTransportVolumeChanged,
+          onCommand: onCommand,
+        ),
+        if (messages.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          _EventPanel(messages: messages),
+        ],
+      ],
+    );
+  }
+}
+
+class _PlayerProxyPanel extends StatelessWidget {
+  final BluezMediaPlayer? player;
+  final ValueChanged<String> onRepeatChanged;
+  final ValueChanged<String> onShuffleChanged;
+  final String? coverArtPath;
+  final bool coverArtLoading;
+  final bool useMprisProxy;
+  final VoidCallback onGetCoverArt;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _PlayerProxyPanel({
+    required this.player,
+    required this.onRepeatChanged,
+    required this.onShuffleChanged,
+    required this.coverArtPath,
+    required this.coverArtLoading,
+    required this.useMprisProxy,
+    required this.onGetCoverArt,
+    required this.onCommand,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final title = _trackValue(player, const ['Title', 'xesam:title']);
+    final artist = _trackValue(player, const ['Artist', 'xesam:artist']);
+    final album = _trackValue(player, const ['Album', 'xesam:album']);
+    final itemPath = _trackValue(player, const ['Item', 'mpris:trackid']);
+    return _SectionPanel(
+      icon: Icons.queue_music,
+      title: 'MediaPlayer1',
+      subtitle: player?.objectPath ?? 'No player support for selected device',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              if (coverArtPath != null) ...[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.file(
+                    io.File(coverArtPath!),
+                    width: 80,
+                    height: 80,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) =>
+                        const Icon(Icons.broken_image, size: 80),
+                  ),
+                ),
+                const SizedBox(width: 16),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      title.isEmpty ? 'No track title' : title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      artist.isEmpty ? 'Unknown artist' : artist,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodyLarge,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _MetricTile(
+                icon: Icons.play_circle_outline,
+                label: 'Status',
+                value: _display(player?.status),
+              ),
+              _MetricTile(
+                icon: Icons.timer_outlined,
+                label: 'Position',
+                value: _formatMilliseconds(player?.position ?? 0),
+              ),
+              _MetricTile(
+                icon: Icons.album_outlined,
+                label: 'Album',
+                value: _display(album),
+              ),
+              _MetricTile(
+                icon: Icons.devices,
+                label: 'Device',
+                value: _display(player?.device),
+              ),
+              _MetricTile(
+                icon: Icons.folder_open,
+                label: 'Browsable',
+                value: player?.browsable ?? false ? 'yes' : 'no',
+              ),
+              _MetricTile(
+                icon: Icons.search,
+                label: 'Searchable',
+                value: player?.searchable ?? false ? 'yes' : 'no',
+              ),
+              _MetricTile(
+                icon: Icons.image_outlined,
+                label: 'Cover art',
+                value: player == null
+                    ? 'unavailable'
+                    : useMprisProxy
+                    ? 'MPRIS'
+                    : 'native OBEX',
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _CommandButton(
+                tooltip: 'Previous',
+                icon: Icons.skip_previous,
+                onPressed: player == null
+                    ? null
+                    : () =>
+                          onCommand('MediaPlayer1 Previous', player!.previous),
+              ),
+              _CommandButton(
+                tooltip: 'Play',
+                icon: Icons.play_arrow,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand('MediaPlayer1 Play', player!.play),
+              ),
+              _CommandButton(
+                tooltip: 'Pause',
+                icon: Icons.pause,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand('MediaPlayer1 Pause', player!.pause),
+              ),
+              _CommandButton(
+                tooltip: 'Stop',
+                icon: Icons.stop,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand('MediaPlayer1 Stop', player!.stop),
+              ),
+              _CommandButton(
+                tooltip: 'Next',
+                icon: Icons.skip_next,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand('MediaPlayer1 Next', player!.next),
+              ),
+              _CommandButton(
+                tooltip: 'Rewind',
+                icon: Icons.fast_rewind,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand('MediaPlayer1 Rewind', player!.rewind),
+              ),
+              _CommandButton(
+                tooltip: 'Fast Forward',
+                icon: Icons.fast_forward,
+                onPressed: player == null
+                    ? null
+                    : () => onCommand(
+                        'MediaPlayer1 Fast forward',
+                        player!.fastForward,
+                      ),
+              ),
+              _CommandButton(
+                tooltip: coverArtLoading
+                    ? 'Downloading cover art'
+                    : 'Get cover art',
+                icon: Icons.image_outlined,
+                onPressed:
+                    player == null ||
+                        coverArtLoading ||
+                        (useMprisProxy
+                            ? itemPath.isEmpty
+                            : player!.imageHandle.isEmpty)
+                    ? null
+                    : onGetCoverArt,
+              ),
+              _RepeatModeControl(
+                repeat: player?.repeat ?? 'off',
+                onChanged: player == null ? null : onRepeatChanged,
+              ),
+              _ShuffleModeControl(
+                shuffle: player?.shuffle ?? 'off',
+                onChanged: player == null ? null : onShuffleChanged,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          // Position slider
+          Row(
+            children: [
+              Text(_formatMilliseconds(player?.position ?? 0)),
+              Expanded(
+                child: Slider(
+                  value: _sliderPosition(player),
+                  max: _sliderMaximum(player),
+                  onChanged: null, // Read-only for now unless we implement seek
+                ),
+              ),
+              Text(_formatMilliseconds(_getDuration(player))),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Track metadata',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          _MetadataTable(properties: player?.track ?? const []),
+        ],
+      ),
+    );
+  }
+}
+
+class _BrowseProxyPanel extends StatelessWidget {
+  final List<BluezMediaFolder> folders;
+  final List<BluezMediaItem> items;
+  final ValueChanged<BluezMediaFolder> onListFolderItems;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _BrowseProxyPanel({
+    required this.folders,
+    required this.items,
+    required this.onListFolderItems,
+    required this.onCommand,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final sortedFolders = [...folders]
+      ..sort((left, right) => left.objectPath.compareTo(right.objectPath));
+    final sortedItems = [...items]
+      ..sort((left, right) => left.objectPath.compareTo(right.objectPath));
+
+    return _SectionPanel(
+      icon: Icons.library_music_outlined,
+      title: 'Media items',
+      subtitle:
+          '${folders.length} folder${folders.length == 1 ? '' : 's'}, '
+          '${items.length} item${items.length == 1 ? '' : 's'}',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (sortedFolders.isEmpty && sortedItems.isEmpty)
+            const Text('No folders or items reported for selected device'),
+          if (sortedFolders.isNotEmpty) ...[
+            Text('Folders', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            for (final folder in sortedFolders)
+              _FolderRow(folder: folder, onListItems: onListFolderItems),
+          ],
+          if (sortedFolders.isNotEmpty && sortedItems.isNotEmpty)
+            const SizedBox(height: 14),
+          if (sortedItems.isNotEmpty) ...[
+            Text('Items', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            for (final item in sortedItems)
+              _ItemRow(
+                key: ValueKey(item.objectPath),
+                item: item,
+                onCommand: onCommand,
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _FolderRow extends StatelessWidget {
+  final BluezMediaFolder folder;
+  final ValueChanged<BluezMediaFolder> onListItems;
+
+  const _FolderRow({required this.folder, required this.onListItems});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              const Icon(Icons.folder_open, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      folder.name.isEmpty
+                          ? _objectName(folder.objectPath)
+                          : folder.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    Text(
+                      '${folder.numberOfItems} item(s) - ${folder.objectPath}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              Tooltip(
+                message: 'List items',
+                child: IconButton.filledTonal(
+                  onPressed: () => onListItems(folder),
+                  icon: const Icon(Icons.format_list_bulleted),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ItemRow extends StatelessWidget {
+  final BluezMediaItem item;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _ItemRow({super.key, required this.item, required this.onCommand});
+  @override
+  Widget build(BuildContext context) {
+    final depth = _itemDepth(item);
+    final title = item.name.isEmpty ? _objectName(item.objectPath) : item.name;
+    final subtitleParts = [
+      if (item.type.isNotEmpty) item.type,
+      if (item.folderType.isNotEmpty) item.folderType,
+      if (item.playable) 'playable',
+    ];
+
+    return Padding(
+      padding: EdgeInsets.only(left: depth * 18.0, bottom: 8),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    item.type == 'folder' || item.folderType.isNotEmpty
+                        ? Icons.folder
+                        : Icons.music_note,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                        Text(
+                          subtitleParts.isEmpty
+                              ? item.objectPath
+                              : '${subtitleParts.join(' - ')} - ${item.objectPath}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
+                  ),
+                  _CommandButton(
+                    tooltip: 'Play item',
+                    icon: Icons.play_arrow,
+                    onPressed: item.playable
+                        ? () => onCommand('MediaItem1 Play', item.play)
+                        : null,
+                  ),
+                  const SizedBox(width: 6),
+                  _CommandButton(
+                    tooltip: 'Add to now playing',
+                    icon: Icons.playlist_add,
+                    onPressed: item.playable
+                        ? () => onCommand(
+                            'MediaItem1 Add to now playing',
+                            item.addToNowPlaying,
+                          )
+                        : null,
+                  ),
+                ],
+              ),
+              const Divider(height: 24),
+              Text('Metadata', style: Theme.of(context).textTheme.labelLarge),
+              const SizedBox(height: 8),
+              _MetadataTable(properties: item.metadata),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ControlProxyPanel extends StatelessWidget {
+  final BluezMediaControl? control;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _ControlProxyPanel({required this.control, required this.onCommand});
+
+  @override
+  Widget build(BuildContext context) {
+    return _SectionPanel(
+      icon: Icons.settings_remote,
+      title: 'MediaControl1',
+      subtitle:
+          control?.objectPath ?? 'No controller support for selected device',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _MetricTile(
+                icon: control?.connected ?? false
+                    ? Icons.bluetooth_connected
+                    : Icons.bluetooth,
+                label: 'Connected',
+                value: control?.connected ?? false ? 'yes' : 'no',
+              ),
+              _MetricTile(
+                icon: Icons.queue_music,
+                label: 'Active player',
+                value: _display(control?.playerPath),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _CommandButton(
+                tooltip: 'Previous',
+                icon: Icons.skip_previous,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand(
+                        'MediaControl1 Previous',
+                        control!.previous,
+                      ),
+              ),
+              _CommandButton(
+                tooltip: 'Play',
+                icon: Icons.play_arrow,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand('MediaControl1 Play', control!.play),
+              ),
+              _CommandButton(
+                tooltip: 'Pause',
+                icon: Icons.pause,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand('MediaControl1 Pause', control!.pause),
+              ),
+              _CommandButton(
+                tooltip: 'Stop',
+                icon: Icons.stop,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand('MediaControl1 Stop', control!.stop),
+              ),
+              _CommandButton(
+                tooltip: 'Next',
+                icon: Icons.skip_next,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand('MediaControl1 Next', control!.next),
+              ),
+              _CommandButton(
+                tooltip: 'Rewind',
+                icon: Icons.fast_rewind,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand('MediaControl1 Rewind', control!.rewind),
+              ),
+              _CommandButton(
+                tooltip: 'Fast Forward',
+                icon: Icons.fast_forward,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand(
+                        'MediaControl1 Fast forward',
+                        control!.fastForward,
+                      ),
+              ),
+              _CommandButton(
+                tooltip: 'Volume Down',
+                icon: Icons.volume_down,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand(
+                        'MediaControl1 Volume down',
+                        control!.volumeDown,
+                      ),
+              ),
+              _CommandButton(
+                tooltip: 'Volume Up',
+                icon: Icons.volume_up,
+                onPressed: control == null
+                    ? null
+                    : () => onCommand(
+                        'MediaControl1 Volume up',
+                        control!.volumeUp,
+                      ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TransportProxyPanel extends StatelessWidget {
+  final BluezMediaTransport? transport;
+  final int transportCount;
+  final double? volumeDraft;
+  final ValueChanged<double> onVolumePreview;
+  final ValueChanged<double> onVolumeChanged;
+  final void Function(String label, FutureOr<void> Function() command)
+  onCommand;
+
+  const _TransportProxyPanel({
+    required this.transport,
+    required this.transportCount,
+    required this.volumeDraft,
+    required this.onVolumePreview,
+    required this.onVolumeChanged,
+    required this.onCommand,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final volume = (volumeDraft ?? transport?.volume ?? 0)
+        .clamp(0, 127)
+        .toDouble();
+
+    return _SectionPanel(
+      icon: Icons.graphic_eq,
+      title: 'MediaTransport1',
+      subtitle: transport == null
+          ? 'No transport support for selected device'
+          : '$transportCount transport${transportCount == 1 ? '' : 's'} available',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _MetricTile(
+                icon: Icons.radio_button_checked,
+                label: 'State',
+                value: _display(transport?.state),
+              ),
+              _MetricTile(
+                icon: Icons.memory,
+                label: 'Codec',
+                value: '${transport?.codec ?? 0}',
+              ),
+              _MetricTile(
+                icon: Icons.timer_outlined,
+                label: 'Delay',
+                value: '${transport?.delay ?? 0}',
+              ),
+              _MetricTile(
+                icon: Icons.devices,
+                label: 'Device',
+                value: _display(transport?.device),
+              ),
+              _MetricTile(
+                icon: Icons.link,
+                label: 'UUID',
+                value: _display(transport?.uuid),
+              ),
+              _MetricTile(
+                icon: Icons.output,
+                label: 'Endpoint',
+                value: _display(transport?.endpoint),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              const Icon(Icons.volume_up),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Slider(
+                  value: volume,
+                  min: 0,
+                  max: 127,
+                  divisions: 127,
+                  label: '${volume.round()}',
+                  onChanged: transport == null ? null : onVolumePreview,
+                  onChangeEnd: transport == null ? null : onVolumeChanged,
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  '${volume.round()}',
+                  textAlign: TextAlign.end,
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _CommandButton(
+                tooltip: 'Refresh transport',
+                icon: Icons.sync,
+                onPressed: transport == null
+                    ? null
+                    : () => onCommand(
+                        'MediaTransport1 Refresh',
+                        transport!.refresh,
+                      ),
+              ),
+              _CommandButton(
+                tooltip: 'Try acquire and close',
+                icon: Icons.output,
+                onPressed: transport == null
+                    ? null
+                    : () => onCommand('MediaTransport1 TryAcquire', () async {
+                        final acquired = await transport!.tryAcquire();
+                        acquired.close();
+                      }),
+              ),
+              _CommandButton(
+                tooltip: 'Release transport',
+                icon: Icons.close,
+                onPressed: transport == null
+                    ? null
+                    : () => onCommand(
+                        'MediaTransport1 Release',
+                        transport!.release,
+                      ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EventPanel extends StatelessWidget {
+  final List<String> messages;
+
+  const _EventPanel({required this.messages});
+
+  @override
+  Widget build(BuildContext context) {
+    return _SectionPanel(
+      icon: Icons.history,
+      title: 'Events',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final message in messages)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text(
+                message,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionPanel extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+  final Widget? trailing;
+  final Widget child;
+
+  const _SectionPanel({
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    this.trailing,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: colors.surface,
+        border: Border.all(color: colors.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: Theme.of(context).textTheme.titleMedium),
+                    if (subtitle != null) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              ?trailing,
+            ],
+          ),
+          const SizedBox(height: 14),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+class _MetricTile extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const _MetricTile({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 188,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Icon(icon, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label, style: Theme.of(context).textTheme.labelMedium),
+                    Text(value, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RepeatModeControl extends StatelessWidget {
+  final String repeat;
+  final ValueChanged<String>? onChanged;
+
+  const _RepeatModeControl({required this.repeat, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = repeat == 'singletrack';
+
+    return _ToggleCommandButton(
+      tooltip: enabled ? 'Repeat off' : 'Repeat single track',
+      icon: enabled ? Icons.repeat_one : Icons.repeat,
+      selected: enabled,
+      onPressed: onChanged == null
+          ? null
+          : () => onChanged!(enabled ? 'off' : 'singletrack'),
+    );
+  }
+}
+
+class _ShuffleModeControl extends StatelessWidget {
+  final String shuffle;
+  final ValueChanged<String>? onChanged;
+
+  const _ShuffleModeControl({required this.shuffle, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = shuffle == 'alltracks';
+
+    return _ToggleCommandButton(
+      tooltip: enabled ? 'Shuffle off' : 'Shuffle all',
+      icon: Icons.shuffle,
+      selected: enabled,
+      onPressed: onChanged == null
+          ? null
+          : () => onChanged!(enabled ? 'off' : 'alltracks'),
+    );
+  }
+}
+
+class _ToggleCommandButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final bool selected;
+  final VoidCallback? onPressed;
+
+  const _ToggleCommandButton({
+    required this.tooltip,
+    required this.icon,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 48,
+        child: IconButton.filledTonal(
+          onPressed: onPressed,
+          icon: Icon(icon, color: selected ? colors.primary : null),
+        ),
+      ),
+    );
+  }
+}
+
+class _CommandButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+
+  const _CommandButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 48,
+        child: IconButton.filledTonal(onPressed: onPressed, icon: Icon(icon)),
+      ),
+    );
+  }
+}
+
+class _MetadataTable extends StatelessWidget {
+  final List<BlueZMediaProperty> properties;
+
+  const _MetadataTable({required this.properties});
+
+  @override
+  Widget build(BuildContext context) {
+    if (properties.isEmpty) {
+      return const Text('No metadata');
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final keyWidth = constraints.maxWidth < 360
+            ? constraints.maxWidth * 0.35
+            : 150.0;
+        return Table(
+          columnWidths: {
+            0: FixedColumnWidth(keyWidth),
+            1: const FlexColumnWidth(),
+          },
+          defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+          children: [
+            for (final property in properties)
+              TableRow(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 12, bottom: 8),
+                    child: Text(
+                      property.key,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.labelLarge,
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      property.value,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+
+  const _EmptyState({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 44),
+            const SizedBox(height: 12),
+            Text(title, style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 6),
+            Text(
+              subtitle,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MediaDevice {
+  final String devicePath;
+  final BluezMediaPlayer? player;
+  final BluezMediaControl? control;
+  final List<BluezMediaTransport> transports;
+  final List<BluezMediaFolder> folders;
+  final List<BluezMediaItem> items;
+
+  const _MediaDevice({
+    required this.devicePath,
+    required this.player,
+    required this.control,
+    required this.transports,
+    required this.folders,
+    required this.items,
+  });
+
+  BluezMediaTransport? get transport => transports.firstOrNull;
+  bool get connected => control?.connected ?? false;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _MediaDevice && other.devicePath == devicePath;
+
+  @override
+  int get hashCode => devicePath.hashCode;
+}
+
+List<_MediaDevice> _mediaDevices(
+  List<BluezMediaPlayer> players,
+  List<BluezMediaControl> controls,
+  List<BluezMediaTransport> transports,
+  List<BluezMediaFolder> folders,
+  List<BluezMediaItem> items,
+) {
+  final devicePaths = <String>{};
+  for (final player in players) {
+    devicePaths.add(_devicePathForPlayer(player));
+  }
+  for (final control in controls) {
+    devicePaths.add(control.objectPath);
+  }
+  for (final transport in transports) {
+    devicePaths.add(_devicePathForTransport(transport));
+  }
+  for (final folder in folders) {
+    devicePaths.add(_devicePathFromObjectPath(folder.objectPath));
+  }
+  for (final item in items) {
+    devicePaths.add(_devicePathForItem(item));
+  }
+
+  return [
+    for (final devicePath in devicePaths.where((path) => path.isNotEmpty))
+      _mediaDeviceForPath(
+        devicePath,
+        players,
+        controls,
+        transports,
+        folders,
+        items,
+      ),
+  ]..sort((left, right) => left.devicePath.compareTo(right.devicePath));
+}
+
+_MediaDevice _mediaDeviceForPath(
+  String devicePath,
+  List<BluezMediaPlayer> players,
+  List<BluezMediaControl> controls,
+  List<BluezMediaTransport> transports,
+  List<BluezMediaFolder> folders,
+  List<BluezMediaItem> items,
+) {
+  final player = players
+      .where((player) => _devicePathForPlayer(player) == devicePath)
+      .firstOrNull;
+  final playerPath = player?.objectPath;
+
+  return _MediaDevice(
+    devicePath: devicePath,
+    player: player,
+    control: controls
+        .where((control) => control.objectPath == devicePath)
+        .firstOrNull,
+    transports: transports
+        .where((transport) => _devicePathForTransport(transport) == devicePath)
+        .toList(),
+    folders: folders
+        .where(
+          (folder) =>
+              _devicePathFromObjectPath(folder.objectPath) == devicePath &&
+              _belongsToPlayer(folder.objectPath, playerPath),
+        )
+        .toList(),
+    items: items
+        .where((item) => _devicePathForItem(item) == devicePath)
+        .toList(),
+  );
+}
+
+String? _keepDeviceSelection(List<_MediaDevice> devices, String? selectedPath) {
+  if (devices.isEmpty) return null;
+  if (selectedPath == null) return devices.first.devicePath;
+  return devices
+          .where((device) => device.devicePath == selectedPath)
+          .firstOrNull
+          ?.devicePath ??
+      devices.first.devicePath;
+}
+
+String _devicePathForPlayer(BluezMediaPlayer player) {
+  if (player.device.isNotEmpty) return player.device;
+  return _devicePathFromObjectPath(player.objectPath);
+}
+
+String _devicePathForTransport(BluezMediaTransport transport) {
+  if (transport.device.isNotEmpty) return transport.device;
+  return _devicePathFromObjectPath(transport.objectPath);
+}
+
+String _devicePathForItem(BluezMediaItem item) {
+  if (item.playerPath.isNotEmpty) {
+    return _devicePathFromObjectPath(item.playerPath);
+  }
+  return _devicePathFromObjectPath(item.objectPath);
+}
+
+String _devicePathFromObjectPath(String objectPath) {
+  final marker = objectPath.indexOf('/dev_');
+  if (marker < 0) return objectPath;
+  final nextSlash = objectPath.indexOf('/', marker + 1);
+  if (nextSlash < 0) return objectPath;
+  return objectPath.substring(0, nextSlash);
+}
+
+String _deviceLabel(_MediaDevice device) {
+  return device.devicePath.split('/').last.replaceAll('_', ':');
+}
+
+String _connectionLabel(_MediaDevice? device) {
+  if (device == null) return 'Not connected';
+  if (device.control == null) return 'Connection unknown';
+  return device.connected ? 'Connected' : 'Not connected';
+}
+
+String _trackValue(BluezMediaPlayer? player, List<String> keys) {
+  if (player == null) return '';
+  for (final key in keys) {
+    for (final property in player.track) {
+      if (property.key == key) return property.value;
+    }
+  }
+  return '';
+}
+
+String _trackKey(BluezMediaPlayer? player) => [
+  _trackValue(player, const ['Title', 'xesam:title']),
+  _trackValue(player, const ['Artist', 'xesam:artist']),
+  _trackValue(player, const ['Album', 'xesam:album']),
+  _trackValue(player, const ['Duration', 'mpris:length']),
+  _trackValue(player, const ['Item', 'mpris:trackid']),
+  player?.imageHandle ?? '',
+].join('\u001f');
+
+List<BluezMediaItem> _mergeItems(
+  List<BluezMediaItem> existing,
+  List<BluezMediaItem> next,
+) {
+  final byPath = {
+    for (final item in existing) item.objectPath: item,
+    for (final item in next) item.objectPath: item,
+  };
+  return byPath.values.toList()
+    ..sort((left, right) => left.objectPath.compareTo(right.objectPath));
+}
+
+bool _belongsToPlayer(String objectPath, String? playerPath) {
+  if (playerPath == null || playerPath.isEmpty) return true;
+  return objectPath == playerPath || objectPath.startsWith('$playerPath/');
+}
+
+int _itemDepth(BluezMediaItem item) {
+  final playerPath = item.playerPath;
+  if (playerPath.isEmpty || !item.objectPath.startsWith('$playerPath/')) {
+    return 0;
+  }
+  final relativePath = item.objectPath.substring(playerPath.length + 1);
+  final segmentCount = relativePath
+      .split('/')
+      .where((segment) => segment.isNotEmpty)
+      .length;
+  final depth = segmentCount - 1;
+  if (depth < 0) return 0;
+  if (depth > 4) return 4;
+  return depth;
+}
+
+String _objectName(String objectPath) {
+  if (objectPath.isEmpty) return 'unknown';
+  return objectPath.split('/').where((segment) => segment.isNotEmpty).last;
+}
+
+int _getDuration(BluezMediaPlayer? player) {
+  if (player == null) return 0;
+  for (final prop in player.track) {
+    if (prop.key == 'Duration') {
+      return int.tryParse(prop.value) ?? 0;
+    }
+  }
+  return 0;
+}
+
+double _sliderMaximum(BluezMediaPlayer? player) {
+  final duration = _getDuration(player);
+  final position = player?.position ?? 0;
+  return [duration, position, 1].reduce((a, b) => a > b ? a : b).toDouble();
+}
+
+double _sliderPosition(BluezMediaPlayer? player) =>
+    (player?.position ?? 0).clamp(0, _sliderMaximum(player)).toDouble();
+
+String _display(String? value) {
+  if (value == null || value.isEmpty) return 'unknown';
+  return value;
+}
+
+String _formatMilliseconds(int milliseconds) {
+  final duration = Duration(milliseconds: milliseconds);
+  final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+  final hours = duration.inHours;
+  if (hours > 0) {
+    return '$hours:$minutes:$seconds';
+  }
+  return '$minutes:$seconds';
+}
